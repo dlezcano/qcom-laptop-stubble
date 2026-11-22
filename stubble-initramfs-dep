@@ -1,0 +1,4 @@
+# Sourced by mkinitramfs via /usr/share/initramfs-tools/conf-hooks.d/.
+# Use a dependency-based initramfs for every kernel.
+# This does not generate an additional initramfs.
+MODULES=dep

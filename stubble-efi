@@ -1,0 +1,183 @@
+#!/bin/sh
+set -eu
+
+KVER="${1:?Missing kernel version}"
+SOURCE="${2:-}"
+DEST="${STUBBLE_OUTPUT:-/boot/vmlinuz-$KVER}"
+
+# ARM64 make install may install Image as vmlinux-<version>
+if [ -z "$SOURCE" ]; then
+    if [ -f "/boot/vmlinux-$KVER" ]; then
+        SOURCE="/boot/vmlinux-$KVER"
+    else
+        SOURCE="/boot/vmlinuz-$KVER"
+    fi
+fi
+
+[ -f "$SOURCE" ] || {
+    echo "stubble: missing kernel image: $SOURCE" >&2
+    exit 1
+}
+
+# Archive vmlinux entries only after successful EFI installation
+archive_vmlinux() {
+    [ -z "${STUBBLE_OUTPUT:-}" ] || return 0
+
+    RAW="/boot/vmlinux-$KVER"
+
+    for candidate in "$RAW" "$RAW.old"; do
+        [ -f "$candidate" ] || continue
+
+        mkdir -p /var/lib/stubble/raw
+        mv -f "$candidate" \
+            "/var/lib/stubble/raw/${candidate##*/}"
+    done
+}
+
+# Avoid wrapping an existing Stubble EFI image
+if objdump -h "$SOURCE" 2>/dev/null |
+   awk '$2 == ".linux" { found=1 }
+        END { exit !found }'; then
+
+    if [ "$SOURCE" != "$DEST" ]; then
+        OUTDIR=$(dirname "$DEST")
+        TMPDIR=$(mktemp -d "$OUTDIR/.stubble.XXXXXXXX")
+        trap 'rm -rf "$TMPDIR"' EXIT
+
+        install -m 0644 "$SOURCE" "$TMPDIR/image"
+        mv -f "$TMPDIR/image" "$DEST"
+    fi
+
+    archive_vmlinux
+
+    echo "stubble: already wrapped; installed $DEST" >&2
+    exit 0
+fi
+
+# Locate the matching kernel build tree
+BUILD=$(readlink -e "/lib/modules/$KVER/build" 2>/dev/null || :)
+
+LINUX="$SOURCE"
+DTBDIR=
+
+# Never reuse an Image from a different kernel release
+if [ -n "$BUILD" ] &&
+   [ -r "$BUILD/include/config/kernel.release" ] &&
+   [ "$(cat "$BUILD/include/config/kernel.release")" = "$KVER" ] &&
+   [ -f "$BUILD/arch/arm64/boot/Image" ]; then
+
+    LINUX="$BUILD/arch/arm64/boot/Image"
+
+    if [ -d "$BUILD/arch/arm64/boot/dts/qcom" ]; then
+        DTBDIR="$BUILD/arch/arm64/boot/dts/qcom"
+    fi
+fi
+
+# Fallback to packaged DTBs
+if [ -z "$DTBDIR" ] &&
+   [ -d "/usr/lib/linux-image-$KVER/qcom" ]; then
+    DTBDIR="/usr/lib/linux-image-$KVER/qcom"
+fi
+
+if [ -z "$DTBDIR" ]; then
+    echo "stubble: no Qualcomm DTB directory for $KVER; skipping" >&2
+    exit 0
+fi
+
+# Only an ARM64 boot Image is accepted
+if ! file -b "$LINUX" |
+     grep -q 'Linux kernel ARM64 boot executable Image'; then
+
+    echo "stubble: no raw ARM64 Image for $KVER (got: $LINUX)" >&2
+    exit 1
+fi
+
+STUB=/usr/lib/stubble/stubble.efi
+HWIDS=/usr/share/stubble/hwids
+MACHDB=/usr/share/stubble/machdb.txt
+
+for f in "$STUB" "$MACHDB"; do
+    [ -f "$f" ] || {
+        echo "stubble: missing $f" >&2
+        exit 1
+    }
+done
+
+[ -d "$HWIDS" ] || {
+    echo "stubble: missing $HWIDS" >&2
+    exit 1
+}
+
+# Prepare stubblify arguments
+set -- build \
+    "--linux=$LINUX" \
+    "--stub=$STUB" \
+    "--hwids=$HWIDS" \
+    "--machdb=$MACHDB" \
+    "--uname=$KVER"
+
+COUNT=0
+
+# Collect all supported Qualcomm laptop DTBs
+for DTB in \
+    "$DTBDIR"/glymur-*.dtb \
+    "$DTBDIR"/hamoa-*.dtb \
+    "$DTBDIR"/x1e*.dtb \
+    "$DTBDIR"/sc8280xp-*.dtb
+do
+    [ -f "$DTB" ] || continue
+
+    # Exclude EL2-specific variants
+    case "${DTB##*/}" in
+        *-el2.dtb|*-el2-*.dtb) continue ;;
+    esac
+
+    set -- "$@" "--devicetree-auto=$DTB"
+    COUNT=$((COUNT + 1))
+done
+
+if [ "$COUNT" -eq 0 ]; then
+    echo "stubble: no Glymur, Hamoa or X1E DTBs found in $DTBDIR; skipping" >&2
+    exit 0
+fi
+
+echo "stubble: embedding $COUNT DTBs from $DTBDIR" >&2
+
+# Build temporary image on the destination filesystem
+OUTDIR=$(dirname "$DEST")
+TMPDIR=$(mktemp -d "$OUTDIR/.stubble.XXXXXXXX")
+trap 'rm -rf "$TMPDIR"' EXIT
+
+OUTPUT="$TMPDIR/vmlinuz-$KVER"
+
+stubblify "$@" "--output=$OUTPUT"
+
+# Validate EFI sections before installation
+objdump -h "$OUTPUT" > "$TMPDIR/sections"
+
+for section in linux hwids machdb; do
+    awk -v name=".$section" \
+        '$2 == name { found=1 }
+         END { exit !found }' \
+        "$TMPDIR/sections" || {
+        echo "stubble: missing section .$section" >&2
+        exit 1
+    }
+done
+
+FOUND=$(awk '$2 == ".dtbauto" { n++ }
+             END { print n+0 }' "$TMPDIR/sections")
+
+[ "$FOUND" -eq "$COUNT" ] || {
+    echo "stubble: expected $COUNT DTBs, got $FOUND" >&2
+    exit 1
+}
+
+# Install the complete EFI image atomically
+chmod 0644 "$OUTPUT"
+mv -f "$OUTPUT" "$DEST"
+
+# Remove raw vmlinux entries from GRUB discovery
+archive_vmlinux
+
+echo "stubble: installed $DEST ($COUNT DTBs)" >&2
